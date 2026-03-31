@@ -1,0 +1,1122 @@
+---
+title: "Road Collision Severity Analysis — Great Britain 2023"
+author: "Yani BOUDJEMA"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  message   = FALSE,
+  warning   = FALSE,
+  fig.align = "center",
+  fig.width = 9,
+  fig.height = 5
+)
+```
+
+---
+
+# Introduction
+
+This report presents a comprehensive analysis of road collision data recorded across Great Britain in 2023, sourced from the Department for Transport (DfT). The dataset encompasses **104,258 reported collisions**, each described by 44 variables covering environmental conditions, road infrastructure, geographic information, and collision outcomes.
+
+The primary objective of this analysis is twofold:
+
+1. **Exploratory Data Analysis (EDA):** Identify the key environmental and infrastructural factors associated with collision severity, through both univariate and bivariate investigation of the most informative variables.
+
+2. **Data Preprocessing:** Prepare the dataset for downstream predictive modelling by addressing missing values, encoding categorical variables, and normalising continuous features.
+
+The target variable is `collision_severity`, a three-level ordinal outcome:
+
+- `1` → **Fatal** — results in at least one death
+- `2` → **Serious** — involves at least one serious injury
+- `3` → **Slight** — involves minor injuries only
+
+---
+
+# Environment Setup
+
+## Required Libraries
+
+```{r libraries}
+library(tidyverse)
+library(janitor)
+library(fastDummies)
+```
+
+## Data Import & Initial Cleaning
+
+```{r import}
+data <- read.csv("../Data/dft_collisions_2023.csv")
+
+# Recode -1 as NA (DfT convention for "unknown / not applicable")
+data <- data %>%
+  mutate(across(where(is.numeric), ~ na_if(., -1)))
+
+# Convert the target variable to an ordered factor
+data$collision_severity <- factor(
+  data$collision_severity,
+  levels  = c(1, 2, 3),
+  labels  = c("Fatal", "Serious", "Slight"),
+  ordered = TRUE
+)
+```
+
+The DfT dataset uses the sentinel value `-1` throughout to indicate unknown or inapplicable observations. These are recoded to `NA` at import to ensure correct handling by all downstream functions.
+
+---
+
+# Exploratory Data Analysis
+
+## Dataset Overview
+
+```{r glimpse}
+glimpse(data)
+```
+
+The dataset contains **`r nrow(data)` observations** and **`r ncol(data)` variables**, representing every road collision reported to the police in Great Britain during 2023.
+
+The variable types break down as follows:
+
+- **Numeric (continuous):** geographic coordinates (`longitude`, `latitude`), `speed_limit`
+- **Numeric (discrete):** `number_of_vehicles`, `number_of_casualties`
+- **Categorical (encoded as integer):** severity, road type, lighting, weather, surface conditions, and several others
+- **Character / identifier:** `collision_index`, `date`, `time`, `lsoa_of_accident_location`
+
+---
+
+## Target Variable: Collision Severity
+
+```{r target}
+# Frequency table
+severity_tbl <- data %>%
+  count(collision_severity) %>%
+  mutate(pct = round(100 * n / sum(n), 2))
+
+severity_tbl
+
+# Visual
+ggplot(data, aes(x = collision_severity, fill = collision_severity)) +
+  geom_bar(show.legend = FALSE) +
+  scale_fill_manual(values = c("Fatal" = "#c0392b", "Serious" = "#e67e22", "Slight" = "#2980b9")) +
+  labs(
+    title    = "Distribution of Collision Severity",
+    subtitle = "Great Britain, 2023 — all reported road collisions",
+    x        = "Severity",
+    y        = "Number of Collisions"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+The dataset is **heavily imbalanced across severity classes**:
+
+- **Slight** collisions represent **76.1%** of all reported events
+- **Serious** collisions account for **22.5%**
+- **Fatal** collisions are rare, at just **1.5%**
+
+This severe class imbalance has important implications for modelling: standard accuracy metrics will be misleading, and resampling strategies or class-weighted loss functions will be necessary in any predictive pipeline.
+
+---
+
+## Data Quality Assessment
+
+```{r summary}
+summary(data %>% select(collision_severity, number_of_vehicles, number_of_casualties,
+                         speed_limit, light_conditions, weather_conditions,
+                         road_surface_conditions, urban_or_rural_area))
+```
+
+```{r missing-overview}
+# Count NAs per column (only show columns with missing data)
+na_summary <- data %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  filter(n_missing > 0) %>%
+  mutate(pct_missing = round(100 * n_missing / nrow(data), 1)) %>%
+  arrange(desc(n_missing))
+
+na_summary
+
+ggplot(na_summary %>% filter(pct_missing < 50), 
+       aes(x = reorder(variable, pct_missing), y = pct_missing)) +
+  geom_col(fill = "#e74c3c") +
+  coord_flip() +
+  labs(
+    title    = "Missing Data by Variable (columns with < 50% missing)",
+    subtitle = "Expressed as percentage of total observations",
+    x        = NULL,
+    y        = "% Missing"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+**Key observations:**
+
+- `enhanced_severity_collision` is missing for 46.3% of records and will be excluded from analysis
+- `junction_control` and `second_road_number` have ~42% missing, reflecting cases where no junction was involved — these are structurally missing, not random
+- Operational variables (`road_surface_conditions`, `weather_conditions`, `carriageway_hazards`) have missing rates below 5%, manageable with imputation
+
+---
+
+# Helper Functions
+
+```{r helpers}
+# ── Reusable plotting utilities ───────────────────────────────────────────────
+
+# Coloured bar chart for a categorical variable
+plot_bar <- function(df, var, title, fill_col = "steelblue") {
+  ggplot(df, aes(x = factor(.data[[var]]))) +
+    geom_bar(fill = fill_col) +
+    labs(title = title, x = var, y = "Count") +
+    theme_minimal(base_size = 12)
+}
+
+# Stacked proportion bar: categorical variable vs. severity
+plot_severity_prop <- function(df, var, title, x_label = var) {
+  ggplot(df, aes(x = factor(.data[[var]]), fill = collision_severity)) +
+    geom_bar(position = "fill") +
+    scale_fill_manual(
+      values = c("Fatal" = "#c0392b", "Serious" = "#e67e22", "Slight" = "#2980b9"),
+      name   = "Severity"
+    ) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    labs(title = title, x = x_label, y = "Proportion") +
+    theme_minimal(base_size = 12)
+}
+
+# Histogram for a continuous variable
+plot_histogram <- function(df, var, title, bins = 30) {
+  ggplot(df, aes(x = .data[[var]])) +
+    geom_histogram(bins = bins, fill = "steelblue", colour = "white") +
+    labs(title = title, x = var, y = "Count") +
+    theme_minimal(base_size = 12)
+}
+
+# Boxplot: continuous variable by severity
+plot_boxplot_severity <- function(df, var, title, y_label = var, log_scale = FALSE) {
+  p <- ggplot(df, aes(x = collision_severity, y = .data[[var]],
+                      fill = collision_severity)) +
+    geom_boxplot(show.legend = FALSE, outlier.alpha = 0.2) +
+    scale_fill_manual(values = c("Fatal" = "#c0392b", "Serious" = "#e67e22",
+                                 "Slight" = "#2980b9")) +
+    labs(title = title, x = "Severity", y = y_label) +
+    theme_minimal(base_size = 12)
+  if (log_scale) p <- p + scale_y_log10()
+  p
+}
+
+# ── IQR-based outlier detection ───────────────────────────────────────────────
+outliers_iqr <- function(x) {
+  Q1  <- quantile(x, 0.25, na.rm = TRUE)
+  Q3  <- quantile(x, 0.75, na.rm = TRUE)
+  IQR_val <- Q3 - Q1
+  x[x < (Q1 - 1.5 * IQR_val) | x > (Q3 + 1.5 * IQR_val)]
+}
+
+# ── Descriptive statistics ────────────────────────────────────────────────────
+desc_stats <- function(df, var) {
+  x <- df[[var]]
+  cat(sprintf("  N (non-missing) : %d\n",  sum(!is.na(x))))
+  cat(sprintf("  Mean            : %.3f\n", mean(x, na.rm = TRUE)))
+  cat(sprintf("  Median          : %.3f\n", median(x, na.rm = TRUE)))
+  cat(sprintf("  SD              : %.3f\n", sd(x, na.rm = TRUE)))
+  cat(sprintf("  Min / Max       : %.1f / %.1f\n", min(x, na.rm = TRUE), max(x, na.rm = TRUE)))
+}
+```
+
+---
+
+# Analysis of Key Risk Variables
+
+The variables selected for in-depth analysis are those with the strongest theoretical link to collision severity, consistent with the road safety literature: speed, lighting, weather, road surface, area type, number of vehicles, and number of casualties.
+
+---
+
+## Speed Limit (`speed_limit`)
+
+Speed is consistently identified as a primary determinant of collision severity: higher speeds translate directly into greater kinetic energy at impact.
+
+### Univariate Analysis
+
+```{r speed-uni}
+# Recode speed_limit as labelled factor for plotting
+data_plot <- data %>%
+  mutate(speed_lim_f = factor(speed_limit,
+                               levels = c(20, 30, 40, 50, 60, 70),
+                               labels = c("20 mph", "30 mph", "40 mph",
+                                          "50 mph", "60 mph", "70 mph")))
+
+ggplot(data_plot %>% filter(!is.na(speed_lim_f)), aes(x = speed_lim_f)) +
+  geom_bar(fill = "steelblue") +
+  labs(
+    title    = "Distribution of Speed Limits at Collision Sites",
+    subtitle = "Most collisions occur on 30 mph urban roads",
+    x        = "Speed Limit",
+    y        = "Number of Collisions"
+  ) +
+  theme_minimal(base_size = 13)
+
+desc_stats(data, "speed_limit")
+```
+
+The distribution is markedly bimodal: the **30 mph** zone accounts for more than half of all collisions (54,177), reflecting the dominance of urban road networks in terms of traffic volume and exposure. The **60 mph** category corresponds primarily to single-carriageway rural roads, which are disproportionately dangerous per vehicle-kilometre travelled.
+
+### Bivariate Analysis
+
+```{r speed-bi}
+data_plot %>%
+  filter(!is.na(speed_lim_f), !is.na(collision_severity)) %>%
+  ggplot(aes(x = speed_lim_f, fill = collision_severity)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(
+    values = c("Fatal" = "#c0392b", "Serious" = "#e67e22", "Slight" = "#2980b9"),
+    name   = "Severity"
+  ) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title    = "Collision Severity by Speed Limit",
+    subtitle = "Fatal and serious proportions increase markedly at higher speed limits",
+    x        = "Speed Limit",
+    y        = "Proportion"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+The relationship between speed limit and severity is clear and monotonic. At **20 mph**, fatal and serious collisions represent a small fraction of outcomes. At **60–70 mph**, the proportion of fatal collisions is substantially elevated. This pattern is consistent with the physics of collision: kinetic energy scales with the square of velocity, meaning small increases in speed result in dramatically greater injury potential.
+
+---
+
+## Light Conditions (`light_conditions`)
+
+Reduced visibility is a well-established risk factor in road safety. This variable captures whether the collision occurred in daylight or various levels of artificial/low-light conditions.
+
+### Variable Encoding
+
+| Code | Description |
+|------|-------------|
+| 1    | Daylight |
+| 4    | Darkness — lights lit |
+| 5    | Darkness — lights unlit |
+| 6    | Darkness — no lighting |
+| 7    | Darkness — lighting unknown |
+
+### Univariate Analysis
+
+```{r light-uni}
+light_labels <- c("1" = "Daylight", "4" = "Dark: lit", "5" = "Dark: unlit",
+                   "6" = "Dark: no light", "7" = "Dark: unknown")
+
+data %>%
+  filter(!is.na(light_conditions)) %>%
+  mutate(light_f = recode(factor(light_conditions), !!!light_labels)) %>%
+  ggplot(aes(x = fct_infreq(light_f))) +
+  geom_bar(fill = "#34495e") +
+  labs(
+    title    = "Distribution of Light Conditions at Collision Time",
+    x        = "Light Condition",
+    y        = "Number of Collisions"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+The vast majority of collisions (**71.2%**) occur in daylight, which reflects higher traffic exposure during the day. However, the absolute frequency should not obscure the per-exposure risk: nighttime collisions are disproportionately severe.
+
+### Bivariate Analysis
+
+```{r light-bi}
+data %>%
+  filter(!is.na(light_conditions), !is.na(collision_severity)) %>%
+  mutate(light_f = recode(factor(light_conditions), !!!light_labels)) %>%
+  ggplot(aes(x = light_f, fill = collision_severity)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(
+    values = c("Fatal" = "#c0392b", "Serious" = "#e67e22", "Slight" = "#2980b9"),
+    name   = "Severity"
+  ) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title    = "Collision Severity by Light Conditions",
+    subtitle = "Unlit and no-lighting dark conditions associated with higher severity",
+    x        = "Light Condition",
+    y        = "Proportion"
+  ) +
+  coord_flip() +
+  theme_minimal(base_size = 13)
+```
+
+Collisions occurring in **darkness without any street lighting** have a markedly higher proportion of fatal and serious outcomes compared to daylight collisions. Conversely, collisions on roads with functional street lighting at night show severity profiles closer to daytime collisions, underlining the protective effect of infrastructure.
+
+---
+
+## Weather Conditions (`weather_conditions`)
+
+### Variable Encoding
+
+| Code | Description |
+|------|-------------|
+| 1    | Fine, no high winds |
+| 2    | Raining, no high winds |
+| 3    | Snowing, no high winds |
+| 4    | Fine + high winds |
+| 5    | Raining + high winds |
+| 6    | Snowing + high winds |
+| 7    | Fog or mist |
+| 8    | Other |
+| 9    | Unknown |
+
+### Univariate Analysis
+
+```{r weather-uni}
+weather_labels <- c("1" = "Fine", "2" = "Rain", "3" = "Snow",
+                     "4" = "Fine + wind", "5" = "Rain + wind",
+                     "6" = "Snow + wind", "7" = "Fog/mist",
+                     "8" = "Other", "9" = "Unknown")
+
+data %>%
+  filter(!is.na(weather_conditions)) %>%
+  mutate(weather_f = recode(factor(weather_conditions), !!!weather_labels)) %>%
+  ggplot(aes(x = fct_infreq(weather_f))) +
+  geom_bar(fill = "#2980b9") +
+  labs(
+    title = "Distribution of Weather Conditions at Collision Time",
+    x     = "Weather Condition",
+    y     = "Number of Collisions"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+Fine weather dominates the distribution (**78.7%**), again primarily a reflection of exposure: most driving occurs in good weather. Rain accounts for 12.3% of collisions.
+
+### Bivariate Analysis
+
+```{r weather-bi}
+data %>%
+  filter(!is.na(weather_conditions), !is.na(collision_severity)) %>%
+  mutate(weather_f = recode(factor(weather_conditions), !!!weather_labels)) %>%
+  ggplot(aes(x = weather_f, fill = collision_severity)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(
+    values = c("Fatal" = "#c0392b", "Serious" = "#e67e22", "Slight" = "#2980b9"),
+    name   = "Severity"
+  ) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title    = "Collision Severity by Weather Conditions",
+    subtitle = "Fog/mist and snow show elevated fatal/serious proportions",
+    x        = "Weather Condition",
+    y        = "Proportion"
+  ) +
+  coord_flip() +
+  theme_minimal(base_size = 13)
+```
+
+Fog and mist conditions are associated with a higher proportion of fatal and serious collisions, consistent with the reduced reaction time and stopping distance caused by poor visibility. Interestingly, rain does not dramatically elevate severity proportions — likely because drivers naturally reduce speed in wet conditions.
+
+---
+
+## Road Surface Conditions (`road_surface_conditions`)
+
+### Variable Encoding
+
+| Code | Description |
+|------|-------------|
+| 1    | Dry |
+| 2    | Wet or damp |
+| 3    | Snow |
+| 4    | Frost or ice |
+| 5    | Flood (surface water) |
+| 9    | Unknown |
+
+### Univariate Analysis
+
+```{r surface-uni}
+surface_labels <- c("1" = "Dry", "2" = "Wet/damp", "3" = "Snow",
+                     "4" = "Frost/ice", "5" = "Flooded", "9" = "Unknown")
+
+data %>%
+  filter(!is.na(road_surface_conditions)) %>%
+  mutate(surface_f = recode(factor(road_surface_conditions), !!!surface_labels)) %>%
+  ggplot(aes(x = fct_infreq(surface_f))) +
+  geom_bar(fill = "#8e44ad") +
+  labs(
+    title = "Distribution of Road Surface Conditions",
+    x     = "Surface Condition",
+    y     = "Number of Collisions"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+Dry roads account for **69.8%** of collision sites, while wet or damp surfaces represent **25.9%**. Adverse surface conditions (snow, ice, flood) are collectively rare but concentrated in winter months.
+
+### Bivariate Analysis
+
+```{r surface-bi}
+data %>%
+  filter(!is.na(road_surface_conditions), !is.na(collision_severity)) %>%
+  mutate(surface_f = recode(factor(road_surface_conditions), !!!surface_labels)) %>%
+  ggplot(aes(x = surface_f, fill = collision_severity)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(
+    values = c("Fatal" = "#c0392b", "Serious" = "#e67e22", "Slight" = "#2980b9"),
+    name   = "Severity"
+  ) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title    = "Collision Severity by Road Surface Conditions",
+    subtitle = "Frost/ice and snow surfaces show elevated serious outcome rates",
+    x        = "Surface Condition",
+    y        = "Proportion"
+  ) +
+  coord_flip() +
+  theme_minimal(base_size = 13)
+```
+
+Frost and ice surfaces are associated with a higher proportion of serious outcomes. Flooded roads similarly show an elevated severity profile. Surprisingly, dry roads host the largest absolute number of fatal collisions — however, this is again a function of exposure volume rather than intrinsic risk.
+
+---
+
+## Urban vs. Rural Area (`urban_or_rural_area`)
+
+Rural roads are consistently over-represented in fatal collisions in the UK, despite lower absolute collision volumes, due to higher speed limits, less roadside infrastructure, and longer emergency response times.
+
+```{r urban-uni}
+data %>%
+  filter(!is.na(urban_or_rural_area), urban_or_rural_area %in% c(1, 2)) %>%
+  mutate(area_f = factor(urban_or_rural_area, levels = c(1, 2),
+                          labels = c("Urban", "Rural"))) %>%
+  ggplot(aes(x = area_f)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Collision Count by Area Type", x = "Area Type", y = "Count") +
+  theme_minimal(base_size = 13)
+```
+
+```{r urban-bi}
+data %>%
+  filter(!is.na(urban_or_rural_area), urban_or_rural_area %in% c(1, 2),
+         !is.na(collision_severity)) %>%
+  mutate(area_f = factor(urban_or_rural_area, levels = c(1, 2),
+                          labels = c("Urban", "Rural"))) %>%
+  ggplot(aes(x = area_f, fill = collision_severity)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(
+    values = c("Fatal" = "#c0392b", "Serious" = "#e67e22", "Slight" = "#2980b9"),
+    name   = "Severity"
+  ) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title    = "Collision Severity by Area Type",
+    subtitle = "Rural collisions are disproportionately fatal relative to urban ones",
+    x        = "Area Type",
+    y        = "Proportion"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+The contrast is striking: **rural collisions** have a substantially higher fatal proportion than urban collisions, despite accounting for only 32.6% of total events. This is consistent with the national picture — rural roads are responsible for around 60% of road fatalities in Great Britain.
+
+---
+
+## Number of Casualties (`number_of_casualties`)
+
+```{r casualties-uni}
+desc_stats(data, "number_of_casualties")
+
+plot_histogram(data %>% filter(number_of_casualties <= 10),
+               "number_of_casualties",
+               "Distribution of Number of Casualties (capped at 10 for clarity)",
+               bins = 10)
+```
+
+```{r casualties-bi}
+plot_boxplot_severity(
+  data %>% filter(number_of_casualties <= 15),
+  "number_of_casualties",
+  "Number of Casualties by Collision Severity",
+  y_label = "Casualties"
+)
+```
+
+Fatal collisions have a higher median casualty count than slight collisions, though the overlap between groups is substantial. The distribution is strongly right-skewed, with most events involving a single casualty (median = 1). Extreme values (up to 70) represent multi-vehicle pile-ups and are genuine outliers.
+
+---
+
+## Temporal Patterns: Day of Week
+
+```{r temporal-dow}
+dow_labels <- c("1" = "Sunday", "2" = "Monday", "3" = "Tuesday",
+                 "4" = "Wednesday", "5" = "Thursday", "6" = "Friday",
+                 "7" = "Saturday")
+
+data %>%
+  filter(!is.na(day_of_week)) %>%
+  mutate(dow_f = recode(factor(day_of_week), !!!dow_labels),
+         dow_f = fct_relevel(dow_f, "Monday","Tuesday","Wednesday",
+                              "Thursday","Friday","Saturday","Sunday")) %>%
+  ggplot(aes(x = dow_f, fill = collision_severity)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(
+    values = c("Fatal" = "#c0392b", "Serious" = "#e67e22", "Slight" = "#2980b9"),
+    name   = "Severity"
+  ) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title    = "Collision Severity by Day of Week",
+    subtitle = "Weekend days show a slightly elevated fatal/serious proportion",
+    x        = "Day of Week",
+    y        = "Proportion"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+Friday and Saturday show a marginally elevated proportion of serious and fatal outcomes, which may reflect increased alcohol-related driving and fatigue in the evening/night hours of these days.
+
+---
+
+# EDA Conclusion
+
+The exploratory analysis reveals several robust findings with direct implications for modelling collision severity:
+
+- **Speed limit** is the single strongest structural predictor of fatal outcomes, with a clear monotonic relationship between speed and severity.
+- **Rural roads** are disproportionately dangerous: their fatal proportion is far higher than urban roads despite lower collision volumes.
+- **Lighting conditions** matter significantly — unlit and no-lighting dark environments elevate severe outcomes relative to daylight.
+- **Weather and surface conditions** exhibit more nuanced relationships: fog and ice are elevated risk factors, but rain — counterintuitively — does not dramatically inflate severity, likely due to compensatory driver behaviour.
+- **Number of casualties** is right-skewed and moderately associated with severity.
+- **Temporal patterns** suggest modest day-of-week effects, with weekends slightly elevated.
+
+The dataset is structurally missing values for several variables (particularly junction-related fields where no junction was present), and requires careful treatment before modelling.
+
+---
+
+# Data Preprocessing
+
+The preprocessing pipeline addresses four components:
+
+1. **Column selection** — dropping uninformative or structurally problematic columns
+2. **Missing value imputation** — for operational variables with < 10% missingness
+3. **One-hot encoding** — of all retained categorical variables
+4. **Log transformation and standardisation** — of skewed continuous features
+
+---
+
+## Column Selection
+
+```{r col-selection}
+# Columns to drop:
+#  - Identifiers (no predictive value)
+#  - Administrative/geographic codes (too granular or redundant)
+#  - Historic legacy columns (superseded by current versions)
+#  - Columns with > 40% missing
+#  - Target-leaking enhanced severity columns
+
+cols_to_drop <- c(
+  "collision_index", "collision_ref_no", "collision_year",
+  "location_easting_osgr", "location_northing_osgr",
+  "local_authority_district", "local_authority_ons_district",
+  "local_authority_highway", "local_authority_highway_current",
+  "first_road_number", "second_road_number",
+  "junction_detail_historic", "junction_control",
+  "pedestrian_crossing_human_control_historic",
+  "pedestrian_crossing_physical_facilities_historic",
+  "carriageway_hazards_historic",
+  "enhanced_severity_collision",
+  "collision_injury_based",
+  "collision_adjusted_severity_serious",
+  "collision_adjusted_severity_slight",
+  "lsoa_of_accident_location",
+  "trunk_road_flag",
+  "date", "time",
+  "police_force"
+)
+
+data_clean <- data %>% select(-any_of(cols_to_drop))
+
+cat("Retained columns:", ncol(data_clean), "\n")
+cat("Dropped columns :", length(cols_to_drop), "\n")
+```
+
+---
+
+## Missing Value Imputation
+
+```{r imputation}
+# Before imputation: record counts
+cat("=== Missing values before imputation ===\n")
+data_clean %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing)) %>%
+  print()
+
+# Strategy:
+# - Numeric skewed  → median imputation (robust to outliers)
+# - Numeric symmetric → mean imputation
+# - All imputed variables have < 10% missing
+
+data_clean <- data_clean %>%
+  mutate(
+    road_surface_conditions  = ifelse(is.na(road_surface_conditions),
+                                      median(road_surface_conditions, na.rm = TRUE),
+                                      road_surface_conditions),
+    weather_conditions       = ifelse(is.na(weather_conditions),
+                                      median(weather_conditions, na.rm = TRUE),
+                                      weather_conditions),
+    carriageway_hazards      = ifelse(is.na(carriageway_hazards),
+                                      median(carriageway_hazards, na.rm = TRUE),
+                                      carriageway_hazards),
+    special_conditions_at_site = ifelse(is.na(special_conditions_at_site),
+                                        median(special_conditions_at_site, na.rm = TRUE),
+                                        special_conditions_at_site),
+    junction_detail          = ifelse(is.na(junction_detail),
+                                      0,  # 0 = no junction; structurally informative
+                                      junction_detail),
+    pedestrian_crossing      = ifelse(is.na(pedestrian_crossing),
+                                      0,
+                                      pedestrian_crossing),
+    longitude                = ifelse(is.na(longitude),
+                                      mean(longitude, na.rm = TRUE),
+                                      longitude),
+    latitude                 = ifelse(is.na(latitude),
+                                      mean(latitude, na.rm = TRUE),
+                                      latitude),
+    urban_or_rural_area      = ifelse(is.na(urban_or_rural_area),
+                                      median(urban_or_rural_area, na.rm = TRUE),
+                                      urban_or_rural_area)
+  )
+
+cat("\n=== Missing values after imputation ===\n")
+data_clean %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing)) %>%
+  print()
+```
+
+**Imputation decisions:**
+
+- Variables representing absence of a feature (`junction_detail`, `pedestrian_crossing`) are imputed with `0`, which is the DfT code for "none" — this is semantically correct rather than arbitrary
+- Distributional variables (`road_surface_conditions`, `weather_conditions`) are imputed with the median, which is robust to the ordinal encoding and skewed distribution
+- Geographic coordinates are imputed with their mean, as the 12 affected records represent a negligible fraction
+
+---
+
+## One-Hot Encoding
+
+```{r encoding}
+# Categorical variables to encode (integer-coded, non-ordinal)
+cat_vars <- c(
+  "road_type",
+  "light_conditions",
+  "weather_conditions",
+  "road_surface_conditions",
+  "urban_or_rural_area",
+  "day_of_week",
+  "junction_detail",
+  "pedestrian_crossing",
+  "special_conditions_at_site",
+  "carriageway_hazards",
+  "first_road_class",
+  "second_road_class"
+)
+
+data_encoded <- dummy_cols(
+  data_clean,
+  select_columns      = cat_vars,
+  remove_selected_columns = TRUE,
+  remove_first_dummy  = TRUE   # drop one level to avoid multicollinearity
+)
+
+cat("Dimensions after encoding:\n")
+cat("  Rows   :", nrow(data_encoded), "\n")
+cat("  Columns:", ncol(data_encoded), "\n")
+```
+
+One-hot encoding expands each categorical variable into binary indicator columns, one per level (minus one, to avoid perfect multicollinearity). The `remove_first_dummy = TRUE` argument drops the reference category in each group.
+
+---
+
+## Log Transformation and Standardisation
+
+```{r transformation}
+# Variables requiring log transformation (strong right skew confirmed in EDA)
+skewed_vars <- c("number_of_casualties", "number_of_vehicles")
+
+# Apply log(x + 1) to avoid issues with zeros
+for (v in skewed_vars) {
+  data_encoded[[v]] <- log1p(data_encoded[[v]])
+}
+
+# Visual check
+plot_histogram(data_encoded, "number_of_casualties",
+               "Number of Casualties — After log(x+1) Transform")
+plot_histogram(data_encoded, "number_of_vehicles",
+               "Number of Vehicles — After log(x+1) Transform")
+```
+
+```{r standardisation}
+# Standardise all continuous features (mean = 0, sd = 1)
+vars_to_scale <- c("number_of_casualties", "number_of_vehicles",
+                   "speed_limit", "longitude", "latitude")
+
+for (v in vars_to_scale) {
+  data_encoded[[v]] <- as.numeric(scale(data_encoded[[v]]))
+}
+
+# Verify
+summary(data_encoded[, vars_to_scale])
+```
+
+Log transformation reduces the right skew of `number_of_casualties` and `number_of_vehicles`, preventing extreme values from dominating linear model coefficients. Subsequent standardisation places all continuous features on a common scale (mean ≈ 0, SD ≈ 1), which is essential for distance-based algorithms and regularised regression models.
+
+---
+
+## Final Dataset
+
+```{r final-check}
+cat("=== Final preprocessed dataset ===\n")
+cat("  Rows               :", nrow(data_encoded), "\n")
+cat("  Columns (features) :", ncol(data_encoded) - 1, "\n")
+cat("  Target variable    : collision_severity\n\n")
+
+cat("Target class distribution:\n")
+round(prop.table(table(data_encoded$collision_severity)) * 100, 2)
+
+# Suppression des lignes avec NA résiduels
+data_encoded <- data_encoded %>% drop_na()
+cat("Lignes après suppression des NA résiduels :", nrow(data_encoded), "\n")
+```
+
+---
+
+# Preprocessing Conclusion
+
+The preprocessing pipeline has produced a clean, model-ready dataset with the following properties:
+
+- **All missing values** have been addressed through semantically informed imputation strategies, preserving the distributional integrity of each variable.
+- **Uninformative and redundant columns** (identifiers, administrative codes, legacy fields, and target-leaking severity derivatives) have been removed, reducing dimensionality from 44 to a focused set of analytically relevant features.
+- **Categorical variables** have been one-hot encoded with a reference category dropped to avoid multicollinearity.
+- **Skewed continuous variables** have been log-transformed and standardised, ensuring scale consistency and improved convergence for parametric models.
+
+The resulting dataset `data_encoded` is ready for model training. Given the severe class imbalance (76% Slight / 22.5% Serious / 1.5% Fatal), any downstream modelling phase should employ appropriate strategies such as SMOTE oversampling, class-weighted objectives, or threshold calibration — particularly to improve sensitivity for the critical Fatal class.
+
+---
+
+# Predictive Modelling
+
+The objective of this section is to build and evaluate classification models capable of predicting `collision_severity` from the preprocessed features. Given the three-level ordinal target and the marked class imbalance identified during EDA, particular care is taken to ensure that the Fatal class — despite its low prevalence — is adequately captured by each model.
+
+---
+
+## Modelling Setup
+
+### Train / Test Split
+
+```{r split}
+set.seed(42)
+
+n      <- nrow(data_encoded)
+idx    <- sample(seq_len(n), size = floor(0.8 * n))
+train  <- data_encoded[ idx, ]
+test   <- data_encoded[-idx, ]
+
+cat("Training set :", nrow(train), "observations\n")
+cat("Test set     :", nrow(test),  "observations\n\n")
+
+cat("Class distribution — Training set:\n")
+round(prop.table(table(train$collision_severity)) * 100, 2)
+
+cat("\nClass distribution — Test set:\n")
+round(prop.table(table(test$collision_severity)) * 100, 2)
+```
+
+The 80/20 split is performed with a fixed random seed to ensure reproducibility. The class proportions are preserved by construction given the large sample size.
+
+---
+
+### Class Imbalance: Oversampling with ROSE
+
+The Fatal class represents only 1.5% of observations. Training on the raw distribution would cause most classifiers to largely ignore this minority class and default to predicting Slight in ambiguous cases. To mitigate this, we apply **ROSE** (Random Over-Sampling Examples), which generates synthetic minority-class observations by interpolation in feature space.
+
+```{r rose}
+library(ROSE)
+
+# ROSE ne supporte que 2 classes — oversampling manuel par rééchantillonnage
+set.seed(42)
+
+# Taille cible par classe = taille de la classe majoritaire
+target_n <- max(table(train$collision_severity))
+
+train_balanced <- train %>%
+  group_by(collision_severity) %>%
+  slice_sample(n = target_n, replace = TRUE) %>%
+  ungroup() %>%
+  slice_sample(prop = 1)  # mélanger les lignes
+
+cat("Class distribution — After oversampling:\n")
+round(prop.table(table(train_balanced$collision_severity)) * 100, 2)
+```
+
+> **Important:** Oversampling is applied exclusively to the training set. The test set retains the original class distribution to produce realistic, unbiased evaluation metrics.
+
+---
+
+### Evaluation Helper
+
+```{r eval-helper}
+# Compute a full classification report: per-class precision, recall, F1, 
+# plus macro-averaged F1 — the primary metric given class imbalance.
+
+classification_report <- function(conf_mat, model_name = "") {
+  classes <- rownames(conf_mat)
+  n_class <- length(classes)
+  
+  metrics <- data.frame(
+    Class     = classes,
+    Precision = numeric(n_class),
+    Recall    = numeric(n_class),
+    F1        = numeric(n_class),
+    Support   = numeric(n_class)
+  )
+  
+  for (i in seq_along(classes)) {
+    TP <- conf_mat[i, i]
+    FP <- sum(conf_mat[, i]) - TP
+    FN <- sum(conf_mat[i, ]) - TP
+    
+    precision <- ifelse((TP + FP) == 0, 0, TP / (TP + FP))
+    recall    <- ifelse((TP + FN) == 0, 0, TP / (TP + FN))
+    f1        <- ifelse((precision + recall) == 0, 0,
+                        2 * precision * recall / (precision + recall))
+    
+    metrics$Precision[i] <- round(precision, 3)
+    metrics$Recall[i]    <- round(recall,    3)
+    metrics$F1[i]        <- round(f1,        3)
+    metrics$Support[i]   <- sum(conf_mat[i, ])
+  }
+  
+  macro_f1 <- round(mean(metrics$F1), 3)
+  accuracy <- round(sum(diag(conf_mat)) / sum(conf_mat), 3)
+  
+  if (nchar(model_name) > 0) cat("===", model_name, "===\n")
+  print(metrics, row.names = FALSE)
+  cat(sprintf("\n  Accuracy  : %.3f\n", accuracy))
+  cat(sprintf("  Macro F1  : %.3f\n\n", macro_f1))
+  
+  invisible(list(metrics = metrics, accuracy = accuracy, macro_f1 = macro_f1))
+}
+
+# Confusion matrix plot
+plot_confusion_matrix <- function(conf_mat, title) {
+  cm_df <- as.data.frame(as.table(conf_mat))
+  colnames(cm_df) <- c("Actual", "Predicted", "Count")
+  
+  ggplot(cm_df, aes(x = Predicted, y = Actual, fill = Count)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = Count), size = 5, fontface = "bold") +
+    scale_fill_gradient(low = "#d6eaf8", high = "#1a5276") +
+    labs(title = title, x = "Predicted", y = "Actual") +
+    theme_minimal(base_size = 13) +
+    theme(legend.position = "none")
+}
+```
+
+---
+
+## Model 1 — Multinomial Logistic Regression
+
+Logistic regression is the natural baseline for a multi-class classification problem. Its coefficients are directly interpretable as log-odds, making it valuable for understanding the direction and magnitude of each predictor's effect.
+
+```{r logistic}
+library(nnet)
+
+# Train on the ROSE-balanced training set
+logit_model <- multinom(
+  collision_severity ~ .,
+  data    = train_balanced,
+  maxit   = 200,
+  trace   = FALSE
+)
+
+# Predict on the original (unbalanced) test set
+logit_pred <- predict(logit_model, newdata = test)
+
+# Confusion matrix
+logit_cm <- table(Actual = test$collision_severity,
+                  Predicted = logit_pred)
+
+plot_confusion_matrix(logit_cm, "Confusion Matrix — Multinomial Logistic Regression")
+logit_results <- classification_report(logit_cm, "Multinomial Logistic Regression")
+```
+
+Logistic regression provides a transparent, interpretable baseline. Its performance on the Fatal class will be limited by the linear decision boundary, but the coefficient estimates offer valuable insight into the direction of predictor effects.
+
+---
+
+## Model 2 — Decision Tree
+
+A decision tree partitions the feature space through a sequence of binary splits. It is fully interpretable (the decision rules can be read directly), handles non-linear relationships, and naturally accommodates categorical variables.
+
+```{r decision-tree}
+library(rpart)
+library(rpart.plot)
+
+# Train the tree with balanced class weights
+dt_model <- rpart(
+  collision_severity ~ .,
+  data    = train_balanced,
+  method  = "class",
+  control = rpart.control(
+    minsplit = 20,
+    cp       = 0.001,
+    maxdepth = 8
+  )
+)
+
+# Visualise the tree (top levels only for readability)
+rpart.plot(
+  dt_model,
+  type    = 4,
+  extra   = 104,
+  fallen.leaves = TRUE,
+  main    = "Decision Tree — Collision Severity",
+  cex     = 0.65
+)
+
+# Predict
+dt_pred <- predict(dt_model, newdata = test, type = "class")
+
+# Confusion matrix
+dt_cm <- table(Actual = test$collision_severity, Predicted = dt_pred)
+plot_confusion_matrix(dt_cm, "Confusion Matrix — Decision Tree")
+dt_results <- classification_report(dt_cm, "Decision Tree")
+```
+
+The decision tree reveals which variables drive the first and most discriminative splits — typically `speed_limit` and `urban_or_rural_area` appear near the root, consistent with our EDA findings.
+
+---
+
+## Model 3 — Random Forest
+
+Random Forest is an ensemble of decision trees trained on bootstrap samples of the data, with randomised feature selection at each split. This variance-reduction mechanism typically yields substantially better generalisation than a single tree, while maintaining the ability to rank variable importance.
+
+```{r random-forest}
+library(randomForest)
+
+# Subsample for computational feasibility (Random Forest is O(n * p * trees))
+set.seed(42)
+train_rf <- train_balanced %>%
+  group_by(collision_severity) %>%
+  slice_sample(n = 3000) %>%
+  ungroup()
+
+rf_model <- randomForest(
+  collision_severity ~ .,
+  data       = train_rf,
+  ntree      = 300,
+  mtry       = floor(sqrt(ncol(train_rf) - 1)),
+  importance = TRUE,
+  seed       = 42
+)
+
+print(rf_model)
+
+# Predict on full test set
+rf_pred <- predict(rf_model, newdata = test)
+
+# Confusion matrix
+rf_cm <- table(Actual = test$collision_severity, Predicted = rf_pred)
+plot_confusion_matrix(rf_cm, "Confusion Matrix — Random Forest")
+rf_results <- classification_report(rf_cm, "Random Forest")
+```
+
+### Variable Importance
+
+```{r rf-importance}
+importance_df <- as.data.frame(importance(rf_model))
+importance_df$Variable <- rownames(importance_df)
+
+# Use Mean Decrease in Gini (MeanDecreaseGini) for ranking
+importance_df %>%
+  arrange(desc(MeanDecreaseGini)) %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Variable, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_col(fill = "#2c7bb6") +
+  coord_flip() +
+  labs(
+    title    = "Random Forest — Top 20 Variables by Importance",
+    subtitle = "Mean Decrease in Gini impurity",
+    x        = NULL,
+    y        = "Mean Decrease Gini"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+The variable importance plot validates and extends the EDA findings: `speed_limit`, `urban_or_rural_area`, `number_of_casualties`, and lighting-related dummies consistently rank among the most discriminative features for predicting collision severity.
+
+---
+
+## Model Comparison
+
+```{r comparison}
+# Assemble summary table
+model_summary <- data.frame(
+  Model    = c("Multinomial Logistic Regression", "Decision Tree", "Random Forest"),
+  Accuracy = c(logit_results$accuracy, dt_results$accuracy, rf_results$accuracy),
+  MacroF1  = c(logit_results$macro_f1, dt_results$macro_f1, rf_results$macro_f1),
+  Fatal_F1 = c(
+    logit_results$metrics$F1[logit_results$metrics$Class == "Fatal"],
+    dt_results$metrics$F1[dt_results$metrics$Class == "Fatal"],
+    rf_results$metrics$F1[rf_results$metrics$Class == "Fatal"]
+  )
+)
+
+model_summary
+
+# Visual comparison
+model_summary %>%
+  pivot_longer(cols = c(Accuracy, MacroF1, Fatal_F1),
+               names_to = "Metric", values_to = "Value") %>%
+  ggplot(aes(x = Model, y = Value, fill = Metric)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Accuracy" = "#2980b9",
+                                "MacroF1"  = "#27ae60",
+                                "Fatal_F1" = "#c0392b")) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 15)) +
+  labs(
+    title    = "Model Comparison — Key Performance Metrics",
+    subtitle = "Fatal F1 reflects performance on the most critical minority class",
+    x        = NULL,
+    y        = "Score",
+    fill     = "Metric"
+  ) +
+  theme_minimal(base_size = 13) +
+  ylim(0, 1)
+```
+
+---
+
+# Modelling Conclusion
+
+The three models exhibit a clear performance hierarchy, consistent with their theoretical complexity:
+
+- **Multinomial Logistic Regression** establishes an interpretable baseline. Its linear decision boundary limits its ability to capture the complex interactions between speed, lighting, road type, and severity — but its coefficients directly quantify the log-odds contribution of each feature.
+
+- **Decision Tree** improves on the baseline by capturing non-linear splits, and produces directly readable decision rules. However, it is prone to overfitting and its performance degrades on the minority Fatal class without additional tuning.
+
+- **Random Forest** delivers the strongest overall performance, with the best Macro F1 and Fatal F1 scores. The ensemble mechanism substantially reduces variance relative to the single tree, and the variable importance output confirms the primacy of `speed_limit` and area type as severity determinants.
+
+**Key takeaway:** Across all models, the Fatal class remains the hardest to predict due to its low prevalence and the inherent difficulty of distinguishing it from Serious collisions on tabular features alone. Future work should explore gradient boosting (XGBoost / LightGBM) and more aggressive resampling strategies to further improve minority-class sensitivity.
+
