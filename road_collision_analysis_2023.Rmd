@@ -59,7 +59,7 @@ library(fastDummies)
 ## Data Import & Initial Cleaning
 
 ```{r import}
-data <- read.csv("../Data/dft_collisions_2023.csv")
+data <- read.csv("Data/dft_collisions_2023.csv")
 
 # Recode -1 as NA (DfT convention for "unknown / not applicable")
 data <- data %>%
